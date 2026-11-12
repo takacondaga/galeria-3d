@@ -1,0 +1,25 @@
+# Godot
+.godot/
+*.import
+*.translation
+export.cfg
+export_credentials.cfg
+
+# Salidas de exportación y binarios
+build/
+dist/
+Galeria_exe/
+*.exe
+*.pck
+*.zip
+*.7z
+
+# Imágenes de las obras (no se versionan)
+cuadros/**
+!cuadros/.gdignore
+!cuadros/README.md
+
+# Basura del sistema
+Thumbs.db
+desktop.ini
+.DS_Store
