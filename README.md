@@ -151,3 +151,9 @@ En `player.gd`: `WALK_SPEED` (2,5), `RUN_SPEED` (4,0), `CROUCH_SPEED` (1,2), `EY
 - Los pasillos salen solo de las paredes norte y sur. Con muchísimas colecciones (decenas) la sala se vuelve muy ancha.
 - Un solo nivel de colecciones: no hay subcolecciones.
 - La carpeta se lee solo al iniciar; para agregar imágenes o colecciones hay que reiniciar.
+
+## Licencia
+
+- El código de este proyecto está bajo la licencia MIT. Ver `LICENSE`.
+- Las imágenes de las obras **no** están incluidas en el repositorio y pertenecen a sus respectivos autores.
+- El ejecutable distribuido incluye Godot Engine 4.3, bajo licencia MIT. Ver `LICENSE-GODOT.txt` para el detalle de Godot y sus componentes de terceros.

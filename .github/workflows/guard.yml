@@ -1,0 +1,54 @@
+name: Guard
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Sin fotos, binarios ni secretos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Bloquear medios y binarios en el historial
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            low="${f,,}"
+            case "$low" in
+              *.jpg|*.jpeg|*.png|*.webp|*.bmp|*.tga|*.tif|*.tiff|*.gif|*.pdf|*.exe|*.pck|*.zip|*.7z|*.rar|*.mp4|*.mov|*.avi|*.mp3|*.wav|*.ogg|*.ttf|*.otf|*.woff|*.woff2)
+                echo "::error file=$f::Archivo no permitido en el repositorio"
+                bad=1
+                ;;
+            esac
+          done < <(git log --all --name-only --pretty=format: | sort -u)
+          while IFS= read -r -d '' f; do
+            size=$(stat -c%s "$f")
+            if [ "$size" -gt 5242880 ]; then
+              echo "::error file=$f::Archivo mayor a 5 MB"
+              bad=1
+            fi
+          done < <(git ls-files -z)
+          exit $bad
+
+      - name: Buscar rutas privadas y secretos
+        shell: bash
+        run: |
+          set -euo pipefail
+          patterns='C:\\Users\\|-----BEGIN [A-Z ]*PRIVATE KEY-----|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|(api[_-]?key|password|secret|token)[[:space:]]*[=:]'
+          mapfile -t commits < <(git rev-list --all)
+          if git grep -nIiE -e "$patterns" "${commits[@]}" -- . ':(exclude).github/workflows/guard.yml'; then
+            echo "::error::Posible secreto o ruta privada detectada"
+            exit 1
+          fi
+          echo "OK: sin secretos detectados"
