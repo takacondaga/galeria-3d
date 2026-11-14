@@ -7,6 +7,7 @@ Para usar la galería, copiá acá tus imágenes con este formato:
 - `nombre__ANCHOxALTO.ext` (por ejemplo `paisaje__80x60.jpg`), con las medidas en centímetros.
 - Sin medidas: `nombre.jpg` usa el tamaño por defecto (120 cm de lado mayor).
 - Dentro de `colección/`, una carpeta por colección; el nombre de la carpeta se muestra en el cartel del pasillo.
+- Las fotos JPEG con orientación EXIF se enderezan solas; los PNG con transparencia se mezclan con la pared.
 
 Ejemplo:
 

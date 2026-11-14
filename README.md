@@ -109,7 +109,7 @@ En `main.gd`:
 | `HIRES_DISTANCE` | 8.0 | Distancia máxima para cargar el detalle (m) |
 | `DEFAULT_SIDE_CM` | 120 | Lado mayor de imágenes sin medidas (cm) |
 | `MIN_SIDE_CM` / `MAX_SIDE_CM` | 5 / 600 | Rango admitido del lado mayor (cm) |
-| `ASPECT_TOLERANCE` | 0.02 | Tolerancia entre medidas e imagen |
+| `ASPECT_TOLERANCE` | 0.1 | Tolerancia entre medidas e imagen |
 | `HANG_HEIGHT` | 1.55 | Altura del centro del cuadro (m) |
 | `GAP_FACTOR`, `GAP_MIN`, `GAP_MAX` | 0.625, 0.3, 1.0 | Separación entre marcos (m) |
 | `CORNER_MARGIN` | 0.6 | Distancia mínima a esquinas y puertas (m) |
@@ -130,21 +130,33 @@ En `player.gd`: `WALK_SPEED` (2,5), `RUN_SPEED` (4,0), `CROUCH_SPEED` (1,2), `EY
 ## Detalles técnicos
 
 - Renderer Compatibility (OpenGL), VSync activo, 60 FPS máximo, filtro anisotrópico 4x.
-- Las imágenes (de la sala y de todas las colecciones) se cargan en un hilo, se reducen a `MAX_TEX_SIZE` con mipmaps y se descartan de memoria tras crear la textura. Los originales no se modifican.
+- La carpeta de obras se elige según el modo: el `.exe` exportado lee `cuadros` junto al ejecutable; el editor y las ejecuciones sin exportar (por ejemplo `--path .`, como la autoprueba) usan `res://cuadros`.
+- Las imágenes (de la sala y de todas las colecciones) se cargan en un hilo, se les aplica la orientación EXIF, se reducen a `MAX_TEX_SIZE` con mipmaps y se descartan de memoria tras crear la textura. Los originales no se modifican.
+- Orientación EXIF: se lee el tag `0x0112` del primer bloque APP1 de los JPEG (big endian o Intel) y se aplica antes de redimensionar, tanto en la textura de pared como en el detalle con zoom.
+- Transparencia: los PNG/WebP con alfa se mezclan con la pared (`TRANSPARENCY_ALPHA`) y llevan un marco de borde para que el fondo se vea. Los JPEG se convierten a RGB8.
 - Una textura por archivo, compartida entre la pared y la vista ampliada.
-- Todos los marcos se dibujan con un único MultiMesh. Draw calls aproximados: cantidad de imágenes + 8 + 7 por colección (5 piezas del pasillo, cartel y texto).
+- Los marcos opacos se dibujan con un único MultiMesh. Cada cuadro con transparencia usa su propio MultiMesh de borde (4 cajas, 1 draw call). Draw calls aproximados: cantidad de imágenes + 8 + 7 por colección (5 piezas del pasillo, cartel y texto).
 - Iluminación: luz ambiente + una luz direccional sin sombras. Se usó luz direccional en lugar de varias OmniLight3D porque el renderer Compatibility limita las luces por objeto y las paredes largas parpadearían.
 - Distribución de la sala: secuencial por los tramos de pared libres de puertas, grupo centrado en cada tramo, ningún cuadro cruza una esquina ni una puerta. La sala crece para que todo quepa.
 - Pasillos: salen hacia afuera de las paredes norte y sur, contiguos entre sí (separados por sus propias paredes), por lo que no pueden superponerse entre sí ni con la sala.
 - El texto del cartel usa la fuente por defecto de Godot (cubre tildes y Ñ).
 - FOV vertical de 65° (en lugar de 75°) para que los tamaños se perciban más cercanos a la escala real.
-- Autoprueba: `godot --headless --path . -- --selftest` verifica medidas, distribución, que los pasillos no se superpongan, que la puerta se pueda cruzar caminando, que la selección no atraviese paredes, el zoom con carga y liberación del detalle, y las velocidades de correr y agacharse (incluyendo altura de cámara y cápsula).
+
+## Autoprueba y CI
+
+La autoprueba verifica medidas, distribución, que los pasillos no se superpongan, que la puerta se pueda cruzar caminando, que la selección no atraviese paredes, el zoom con carga y liberación del detalle, las velocidades de correr y agacharse, la orientación EXIF y la transparencia:
+
+```bash
+godot --headless --editor --quit --path .    # una vez: genera .godot y registra las clases
+godot --headless --path . -- --selftest
+```
+
+El workflow `.github/workflows/selftest.yml` corre lo mismo en cada push: descarga Godot 4.3, genera una galería sintética con `python3 .github/scripts/make_test_gallery.py` (Pillow), importa el proyecto y ejecuta la autoprueba. `cuadros/` no se versiona; el script crea sala y colecciones, una foto con EXIF girado, un PNG con alfa y un original de 3000 px para el detalle con zoom.
 
 ## Limitaciones conocidas
 
 - Formatos: jpg, jpeg, png, webp, bmp, tga. Otros archivos se ignoran.
-- La orientación EXIF no se aplica: una foto guardada con rotación EXIF puede verse girada.
-- PNG con transparencia: se conserva el alfa, pero el cuadro no se mezcla con la pared.
+- La orientación EXIF solo se lee en JPEG; otros formatos con metadatos de rotación no se corrigen.
 - Si se renombra un archivo, hay que mantener el sufijo `__ANCHOxALTO`; sin él pasa al tamaño por defecto.
 - Memoria: textura de 2048×1536 RGB con mipmaps ≈ 12,6 MB; 100 imágenes ≈ 1,3 GB, contando sala y colecciones. El detalle con zoom suma hasta ≈ 50 MB por un cuadro a la vez. Bajar `MAX_TEX_SIZE` a 1536 reduce el uso casi a la mitad.
 - Una obra de más de ~4 m de ancho se ve blanda de cerca aun con detalle de 4096 px.
