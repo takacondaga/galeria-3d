@@ -1,0 +1,87 @@
+name: Selftest
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GODOT_VERSION: 4.3-stable
+
+jobs:
+  selftest:
+    name: Autoprueba headless
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache de Godot
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/godot
+          key: godot-${{ env.GODOT_VERSION }}-linux-x86_64
+
+      - name: Descargar Godot
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/godot"
+          curl -fsSLo "$RUNNER_TEMP/godot.zip" \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          unzip -q "$RUNNER_TEMP/godot.zip" -d "$RUNNER_TEMP/godot"
+
+      - name: Preparar Godot
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x "$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64"
+          "$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64" --version
+
+      - name: Dependencias del sistema
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libfontconfig1 libx11-6 libxcursor1 libxinerama1 libxrandr2 libxi6 libgl1
+
+      - name: Instalar Pillow
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! python3 -m venv "$RUNNER_TEMP/venv" 2>/dev/null; then
+            sudo apt-get install -y -qq python3-venv
+            python3 -m venv "$RUNNER_TEMP/venv"
+          fi
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --disable-pip-version-check pillow
+
+      - name: Generar galería de prueba
+        shell: bash
+        run: |
+          "$RUNNER_TEMP/venv/bin/python" .github/scripts/make_test_gallery.py
+
+      - name: Importar el proyecto
+        shell: bash
+        run: >-
+          "$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64"
+          --headless --editor --quit --path .
+
+      - name: Autoprueba
+        shell: bash
+        run: |
+          set -eo pipefail
+          "$RUNNER_TEMP/godot/Godot_v${GODOT_VERSION}_linux.x86_64" \
+            --headless --path . -- --selftest 2>&1 | tee selftest.log
+
+      - name: Publicar salida de Godot
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: godot-selftest
+          path: selftest.log
+          if-no-files-found: ignore
+          retention-days: 7
