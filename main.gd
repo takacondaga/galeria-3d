@@ -70,7 +70,8 @@ var _hires_idx := -1                # cuadro que muestra el detalle
 var _hires_loading := -1            # cuadro cuyo detalle se está cargando
 
 var _paintings: Array = []          # datos por imagen cargada
-var _placed: Array = []             # {name, tex, mat, path, hires, center, normal, right, ow, oh, tol, wall, offset}
+var _placed: Array = []             # {name, tex, mat, path, hires, center, normal, right, ow, oh, tol, wall, offset, alpha}
+var _alpha_frames := 0              # cuadros con marco de borde (imágenes con transparencia)
 var _player: Player
 var _target := -1
 
@@ -107,10 +108,12 @@ func _exit_tree() -> void:
 
 # ---------- CARPETAS E IMÁGENES ----------
 
+## Carpeta de obras: junto al ejecutable en builds exportados; res://cuadros en el editor
+## y en ejecuciones con --path (por ejemplo, la autoprueba de CI).
 func _gallery_dir() -> String:
-	if OS.has_feature("editor"):
-		return ProjectSettings.globalize_path("res://cuadros")
-	return OS.get_executable_path().get_base_dir().path_join("cuadros")
+	if OS.has_feature("template"):
+		return OS.get_executable_path().get_base_dir().path_join("cuadros")
+	return ProjectSettings.globalize_path("res://cuadros")
 
 
 func _list_images(dir_path: String) -> Array[String]:
@@ -170,19 +173,150 @@ static func _parse_name(base: String) -> Dictionary:
 	}
 
 
-## Reduce al máximo indicado, quita alfa si no se usa y genera mipmaps. No toca el archivo original.
-static func _prepare_image(img: Image, max_size: int) -> void:
+## Reduce al máximo indicado, deja alfa solo si se usa y genera mipmaps. No toca el archivo original.
+## Devuelve true si la imagen conserva transparencia (hay que mezclarla con la pared).
+static func _prepare_image(img: Image, max_size: int) -> bool:
 	var w := img.get_width()
 	var h := img.get_height()
 	var m := maxi(w, h)
 	if m > max_size:
 		var s := float(max_size) / float(m)
 		img.resize(maxi(1, roundi(w * s)), maxi(1, roundi(h * s)), Image.INTERPOLATE_LANCZOS)
-	if img.detect_alpha() == Image.ALPHA_NONE:
-		img.convert(Image.FORMAT_RGB8)
-	else:
+	var has_alpha := img.detect_alpha() != Image.ALPHA_NONE
+	if has_alpha:
 		img.convert(Image.FORMAT_RGBA8)
+	else:
+		img.convert(Image.FORMAT_RGB8)
 	img.generate_mipmaps()
+	return has_alpha
+
+
+## Carga una imagen y aplica la orientación EXIF de los JPEG (Godot la ignora).
+static func _load_image(path: String) -> Image:
+	var img := Image.load_from_file(path)
+	if img == null or img.is_empty():
+		return img
+	if path.get_extension().to_lower() in ["jpg", "jpeg"]:
+		_apply_orientation(img, _jpeg_orientation(path))
+	return img
+
+
+## Orientación EXIF de un JPEG leída desde el archivo; 1 (normal) si no hay.
+## El bloque APP1 suele estar al principio, así que alcanza con leer el encabezado.
+static func _jpeg_orientation(path: String) -> int:
+	var f := FileAccess.open(path, FileAccess.READ)
+	if f == null:
+		return 1
+	var bytes := f.get_buffer(131072)
+	f.close()
+	return _exif_orientation(bytes)
+
+
+## Recorre los segmentos JPEG hasta el APP1 con "Exif\0\0" y devuelve el tag 0x0112 (1-8).
+static func _exif_orientation(bytes: PackedByteArray) -> int:
+	if bytes.size() < 4 or bytes[0] != 0xFF or bytes[1] != 0xD8:
+		return 1
+	var i := 2
+	while i + 4 <= bytes.size():
+		if bytes[i] != 0xFF:
+			return 1
+		var marker := bytes[i + 1]
+		if marker == 0xD8 or marker == 0x01 or (marker >= 0xD0 and marker <= 0xD7):
+			i += 2
+			continue
+		if marker == 0xD9 or marker == 0xDA:      # fin de imagen o inicio del escaneo
+			return 1
+		var size := (bytes[i + 2] << 8) | bytes[i + 3]
+		if size < 2 or i + 2 + size > bytes.size():
+			return 1
+		var payload := i + 4
+		if marker == 0xE1 and _is_exif_header(bytes, payload, i + 2 + size):
+			return _tiff_orientation(bytes, payload + 6, i + 2 + size)
+		i += 2 + size
+	return 1
+
+
+static func _is_exif_header(bytes: PackedByteArray, at: int, limit: int) -> bool:
+	if at + 6 > limit:
+		return false
+	return bytes[at] == 0x45 and bytes[at + 1] == 0x78 and bytes[at + 2] == 0x69 \
+		and bytes[at + 3] == 0x66 and bytes[at + 4] == 0x00 and bytes[at + 5] == 0x00
+
+
+## Lee el IFD0 del bloque TIFF (big endian o Intel) y busca el tag de orientación.
+static func _tiff_orientation(bytes: PackedByteArray, base: int, limit: int) -> int:
+	if base + 8 > limit:
+		return 1
+	var little := bytes[base] == 0x49 and bytes[base + 1] == 0x49
+	var big := bytes[base] == 0x4D and bytes[base + 1] == 0x4D
+	if not little and not big:
+		return 1
+	var ifd := base + _u32(bytes, base + 4, little, limit)
+	if ifd < base or ifd + 2 > limit:
+		return 1
+	var count := _u16(bytes, ifd, little, limit)
+	for k in count:
+		var entry := ifd + 2 + k * 12
+		if entry + 12 > limit:
+			return 1
+		if _u16(bytes, entry, little, limit) != 0x0112:
+			continue
+		if _u16(bytes, entry + 2, little, limit) != 3:      # SHORT
+			return 1
+		if _u32(bytes, entry + 4, little, limit) < 1:
+			return 1
+		var value := _u16(bytes, entry + 8, little, limit)
+		return value if value >= 1 and value <= 8 else 1
+	return 1
+
+
+static func _u16(bytes: PackedByteArray, at: int, little: bool, limit: int) -> int:
+	if at < 0 or at + 2 > limit or at + 2 > bytes.size():
+		return -1
+	if little:
+		return bytes[at] | (bytes[at + 1] << 8)
+	return (bytes[at] << 8) | bytes[at + 1]
+
+
+static func _u32(bytes: PackedByteArray, at: int, little: bool, limit: int) -> int:
+	if at < 0 or at + 4 > limit or at + 4 > bytes.size():
+		return 0
+	if little:
+		return bytes[at] | (bytes[at + 1] << 8) | (bytes[at + 2] << 16) | (bytes[at + 3] << 24)
+	return (bytes[at] << 24) | (bytes[at + 1] << 16) | (bytes[at + 2] << 8) | bytes[at + 3]
+
+
+## Aplica la orientación EXIF: 1 normal, 2 espejo X, 3 giro 180, 4 espejo Y,
+## 5 transponer, 6 girar 90 horario, 7 transponer al revés, 8 girar 90 antihorario.
+static func _apply_orientation(img: Image, orientation: int) -> void:
+	match orientation:
+		2:
+			img.flip_x()
+		3:
+			img.rotate_180()
+		4:
+			img.flip_y()
+		5:
+			img.rotate_90(CLOCKWISE)
+			img.flip_x()
+		6:
+			img.rotate_90(CLOCKWISE)
+		7:
+			img.rotate_90(CLOCKWISE)
+			img.flip_y()
+		8:
+			img.rotate_90(COUNTERCLOCKWISE)
+
+
+## Material del cuadro: sin luz y con mezcla alfa cuando la imagen tiene transparencia.
+static func _painting_material(tex: Texture2D, has_alpha: bool) -> StandardMaterial3D:
+	var mat := StandardMaterial3D.new()
+	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+	mat.albedo_texture = tex
+	mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
+	if has_alpha:
+		mat.transparency = BaseMaterial3D.TRANSPARENCY_ALPHA
+	return mat
 
 
 ## Hilo secundario de carga inicial.
@@ -190,13 +324,13 @@ func _worker() -> void:
 	for f in _files:
 		var path: String = f.path
 		var item = null
-		var img: Image = Image.load_from_file(path)
+		var img: Image = _load_image(path)
 		if img != null and not img.is_empty():
 			var orig_max := maxi(img.get_width(), img.get_height())
-			_prepare_image(img, MAX_TEX_SIZE)
+			var has_alpha := _prepare_image(img, MAX_TEX_SIZE)
 			var info := _parse_name(path.get_file().get_basename())
 			item = {"name": info.name, "w_cm": info.w, "h_cm": info.h, "path": path, "coll": f.coll,
-				"orig_max": orig_max, "image": img}
+				"orig_max": orig_max, "image": img, "has_alpha": has_alpha}
 		else:
 			push_warning("No se pudo cargar: " + path)
 		_mutex.lock()
@@ -231,7 +365,7 @@ func _poll_loading() -> void:
 			"name": it.name, "tex": ImageTexture.create_from_image(img),
 			"aspect": float(img.get_width()) / float(img.get_height()),
 			"path": it.path, "coll": it.coll, "w_cm": it.w_cm, "h_cm": it.h_cm,
-			"hires": it.orig_max > MAX_TEX_SIZE,
+			"hires": it.orig_max > MAX_TEX_SIZE, "has_alpha": it.has_alpha,
 		})
 	_msg.text = "Cargando %d/%d" % [attempted, _files.size()]
 	if finished:
@@ -583,28 +717,33 @@ func _hang_paintings() -> void:
 	var box := BoxMesh.new()
 	box.size = Vector3.ONE
 	box.material = _flat_material(COLOR_FRAME)
-	var frames := MultiMesh.new()
-	frames.transform_format = MultiMesh.TRANSFORM_3D
-	frames.mesh = box
-	frames.instance_count = _paintings.size()
-	var k := 0
+	var frames: Array[Transform3D] = []     # cuadros opacos: una caja llena detrás
+	var borders: Array[Transform3D] = []    # cuadros con alfa: marco de borde (4 cajas)
 	for ri in _runs.size():
 		var run: Dictionary = _runs[ri]
 		var n: Vector3 = run.normal
+		var dir: Vector3 = run.dir
 		var yaw := atan2(n.x, n.z)
 		var rot := Basis(Vector3.UP, yaw)
 		for it in run.items:
 			var p: Dictionary = _paintings[it.idx]
-			var base: Vector3 = run.origin + run.dir * (it.s + p.ow * 0.5) + Vector3(0, p.cy, 0)
+			var base: Vector3 = run.origin + dir * (it.s + p.ow * 0.5) + Vector3(0, p.cy, 0)
 			var frame_pos: Vector3 = base + n * (p.fd * 0.5)
-			frames.set_instance_transform(k, Transform3D(rot * Basis.from_scale(Vector3(p.ow, p.oh, p.fd)), frame_pos))
-			k += 1
+			if p.has_alpha:
+				# Un PNG transparente debe dejar ver la pared: el marco es un borde, no una caja llena.
+				_alpha_frames += 1
+				var cx: float = p.ow * 0.5 - p.ft * 0.5
+				var cy: float = p.oh * 0.5 - p.ft * 0.5
+				var side := Vector3(p.ft, p.oh - 2.0 * p.ft, p.fd)
+				borders.append(Transform3D(rot * Basis.from_scale(Vector3(p.ow, p.ft, p.fd)), frame_pos + Vector3.UP * cy))
+				borders.append(Transform3D(rot * Basis.from_scale(Vector3(p.ow, p.ft, p.fd)), frame_pos - Vector3.UP * cy))
+				borders.append(Transform3D(rot * Basis.from_scale(side), frame_pos - dir * cx))
+				borders.append(Transform3D(rot * Basis.from_scale(side), frame_pos + dir * cx))
+			else:
+				frames.append(Transform3D(rot * Basis.from_scale(Vector3(p.ow, p.oh, p.fd)), frame_pos))
 			var quad := QuadMesh.new()
 			quad.size = Vector2(p.w, p.h)
-			var mat := StandardMaterial3D.new()
-			mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-			mat.albedo_texture = p.tex
-			mat.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR_WITH_MIPMAPS_ANISOTROPIC
+			var mat := _painting_material(p.tex, p.has_alpha)
 			var mi := MeshInstance3D.new()
 			mi.mesh = quad
 			mi.material_override = mat
@@ -613,10 +752,24 @@ func _hang_paintings() -> void:
 			add_child(mi)
 			_placed.append({"name": p.name, "tex": p.tex, "mat": mat, "path": p.path, "hires": p.hires,
 				"center": frame_pos, "normal": n, "right": run.dir,
-				"ow": p.ow, "oh": p.oh, "tol": p.tol, "wall": ri, "offset": it.s})
+				"ow": p.ow, "oh": p.oh, "tol": p.tol, "wall": ri, "offset": it.s, "alpha": p.has_alpha})
+	if not frames.is_empty():
+		add_child(_frame_multimesh(box, frames))
+	if not borders.is_empty():
+		add_child(_frame_multimesh(box, borders))
+
+
+## Instancia un mismo mesh con las transformaciones dadas: un solo draw call.
+func _frame_multimesh(mesh: Mesh, xforms: Array[Transform3D]) -> MultiMeshInstance3D:
+	var mm := MultiMesh.new()
+	mm.transform_format = MultiMesh.TRANSFORM_3D
+	mm.mesh = mesh
+	mm.instance_count = xforms.size()
+	for i in xforms.size():
+		mm.set_instance_transform(i, xforms[i])
 	var mmi := MultiMeshInstance3D.new()
-	mmi.multimesh = frames
-	add_child(mmi)
+	mmi.multimesh = mm
+	return mmi
 
 
 func _setup_environment() -> void:
@@ -739,7 +892,7 @@ func _update_hires() -> void:
 
 
 func _hires_worker(idx: int, path: String) -> void:
-	var img: Image = Image.load_from_file(path)
+	var img: Image = _load_image(path)
 	var result = null
 	if img != null and not img.is_empty():
 		_prepare_image(img, HIRES_TEX_SIZE)
@@ -874,7 +1027,16 @@ func _selftest(a: float, b: float) -> void:
 	if t3.name != "sin medidas 1920x1080" or t3.w != 0.0:
 		ok = false
 		notes.append("parseo 3")
-	# 4) Zoom con detalle de alta resolución
+	# 4) Orientación EXIF y transparencia
+	var exif_ok := _test_exif()
+	var alpha_ok := _test_alpha()
+	if not exif_ok:
+		ok = false
+		notes.append("orientación EXIF")
+	if not alpha_ok:
+		ok = false
+		notes.append("transparencia")
+	# 5) Zoom con detalle de alta resolución
 	var detail := "n/a"
 	for i in _placed.size():
 		if _placed[i].hires:
@@ -883,7 +1045,7 @@ func _selftest(a: float, b: float) -> void:
 			if not d_ok:
 				ok = false
 			break
-	# 5) Pasillos: se cruza la puerta y la selección no atraviesa paredes
+	# 6) Pasillos: se cruza la puerta y la selección no atraviesa paredes
 	var walk := "n/a"
 	var occl := "n/a"
 	if not _corridors.is_empty():
@@ -892,15 +1054,107 @@ func _selftest(a: float, b: float) -> void:
 		var o_ok: bool = await _test_occlusion()
 		occl = "OK" if o_ok else "FALLA"
 		ok = ok and w_ok and o_ok
-	# 6) Agacharse (Ctrl) y correr (Shift)
+	# 7) Agacharse (Ctrl) y correr (Shift)
 	var move_ok: bool = await _test_movement()
 	ok = ok and move_ok
 	print("SELFTEST ", "PASS" if ok else "FAIL", " cuadros=", _placed.size(), "/", _files.size(),
 		" colecciones=", _corridors.size(), " sala=", snappedf(a, 0.1), "x", snappedf(b, 0.1), "x", snappedf(_room_h, 0.1),
+		" exif=", "OK" if exif_ok else "FALLA", " alfa=", "OK" if alpha_ok else "FALLA",
 		" detalle_zoom=", detail, " puerta=", walk, " oclusion=", occl, " movimiento=", "OK" if move_ok else "FALLA")
 	for n in notes:
 		print("  - ", n)
 	get_tree().quit(0 if ok else 1)
+
+
+## Orientación EXIF: parser sobre bytes sintéticos (big endian e Intel) y vuelta completa
+## con un JPEG real, además de la matriz de orientaciones 5, 7 y 8.
+func _test_exif() -> bool:
+	var tiff_be := PackedByteArray([
+		0x4D, 0x4D, 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08,                          # TIFF big endian, IFD0 en 8
+		0x00, 0x01,                                                              # 1 entrada
+		0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00,  # 0x0112 SHORT = 6
+		0x00, 0x00, 0x00, 0x00,
+	])
+	var tiff_le := PackedByteArray([
+		0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00,                          # TIFF Intel, IFD0 en 8
+		0x01, 0x00,
+		0x12, 0x01, 0x03, 0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	])
+	var parsed := _exif_orientation(_jpeg_with_exif(tiff_be)) == 6
+	var parsed_le := _exif_orientation(_jpeg_with_exif(tiff_le)) == 6
+
+	# JPEG real de 40x20 con EXIF 6: al cargarlo debe quedar de 20x40.
+	var src := Image.create(40, 20, false, Image.FORMAT_RGB8)
+	src.fill(Color(0.8, 0.3, 0.1))
+	var jpg := src.save_jpg_to_buffer(0.9)
+	var stitched := PackedByteArray([0xFF, 0xD8])
+	stitched.append_array(_jpeg_with_exif(tiff_be).slice(2))
+	stitched.append_array(jpg.slice(2))                    # el JPEG original, sin su SOI
+	var path := "user://selftest_exif.jpg"
+	var f := FileAccess.open(path, FileAccess.WRITE)
+	if f == null:
+		return false
+	f.store_buffer(stitched)
+	f.close()
+	var loaded := _load_image(path)
+	var real := loaded != null and not loaded.is_empty() \
+		and loaded.get_width() == 20 and loaded.get_height() == 40
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+
+	# Imagen 3x2 con esquinas roja y azul: 5 = transponer, 7 = transponer al revés, 8 = girar antihorario.
+	var m := Image.create(3, 2, false, Image.FORMAT_RGB8)
+	m.fill(Color.BLACK)
+	m.set_pixel(0, 0, Color(1, 0, 0))
+	m.set_pixel(2, 0, Color(0, 0, 1))
+	var o5 := m.duplicate() as Image
+	_apply_orientation(o5, 5)
+	var transpose_ok := o5.get_width() == 2 and o5.get_height() == 3 \
+		and o5.get_pixel(0, 0).r > 0.9 and o5.get_pixel(0, 2).b > 0.9
+	var o7 := m.duplicate() as Image
+	_apply_orientation(o7, 7)
+	var transverse_ok := o7.get_width() == 2 and o7.get_height() == 3 \
+		and o7.get_pixel(1, 0).b > 0.9 and o7.get_pixel(1, 2).r > 0.9
+	var o8 := m.duplicate() as Image
+	_apply_orientation(o8, 8)
+	var ccw_ok := o8.get_width() == 2 and o8.get_height() == 3 and o8.get_pixel(0, 2).r > 0.9
+	return parsed and parsed_le and real and transpose_ok and transverse_ok and ccw_ok
+
+
+## JPEG mínimo (SOI + APP1 Exif) con el bloque TIFF indicado.
+func _jpeg_with_exif(tiff: PackedByteArray) -> PackedByteArray:
+	var payload := PackedByteArray([0x45, 0x78, 0x69, 0x66, 0x00, 0x00])   # "Exif\0\0"
+	payload.append_array(tiff)
+	var size := payload.size() + 2
+	var bytes := PackedByteArray([0xFF, 0xD8, 0xFF, 0xE1, (size >> 8) & 0xFF, size & 0xFF])
+	bytes.append_array(payload)
+	return bytes
+
+
+## PNG con alfa: se conserva al cargar, el material mezcla con la pared y el marco es de borde.
+func _test_alpha() -> bool:
+	var img := Image.create(8, 8, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0, 0, 0, 0))
+	img.set_pixel(4, 4, Color(1, 0, 0, 1))
+	var path := "user://selftest_alpha.png"
+	var saved := img.save_png(path) == OK
+	var loaded := _load_image(path)
+	var keeps_alpha := saved and loaded != null and not loaded.is_empty() \
+		and loaded.detect_alpha() != Image.ALPHA_NONE
+	var prepared_flag := false
+	if keeps_alpha:
+		var copy := loaded.duplicate() as Image
+		prepared_flag = _prepare_image(copy, 64)
+	DirAccess.remove_absolute(ProjectSettings.globalize_path(path))
+	var alpha_mat := _painting_material(ImageTexture.create_from_image(img), true)
+	var opaque_img := Image.create(4, 4, false, Image.FORMAT_RGB8)
+	opaque_img.fill(Color(0.2, 0.4, 0.6))
+	var opaque_mat := _painting_material(ImageTexture.create_from_image(opaque_img), false)
+	var alphas := _placed.filter(func(p): return p.alpha).size()
+	return keeps_alpha and prepared_flag \
+		and alpha_mat.transparency == BaseMaterial3D.TRANSPARENCY_ALPHA \
+		and opaque_mat.transparency == BaseMaterial3D.TRANSPARENCY_DISABLED \
+		and _alpha_frames == alphas
 
 
 func _key_press(code: Key, pressed: bool) -> void:
